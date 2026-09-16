@@ -96,6 +96,7 @@ input, select, textarea, button { font-family: var(--sans); color: var(--text); 
 .metric-progress-fill { height: 100%; width: 0%; border-radius: 10px; transition: width .5s var(--fluid); }
 .metric-progress-fill.done-fill { background: var(--done); } .metric-progress-fill.pending-fill { background: var(--prog); } .metric-progress-fill.breached-fill { background: var(--danger); }
 .workspace-bar { display: grid; grid-template-columns: 1fr auto; gap: 14px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius-lg); padding: 14px; margin-bottom: 28px; align-items: center; }
+.task-add-bar { grid-template-columns: 2fr 1fr 1fr auto; }
 .ecosystem-grid { display: grid; grid-template-columns: repeat(auto-fill,minmax(300px,1fr)); gap: 18px; }
 .ecosystem-card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius-lg); padding: 28px; cursor: pointer; transition: all .3s var(--fluid); display: flex; flex-direction: column; }
 .ecosystem-card:hover { border-color: var(--accent); transform: translateY(-3px); box-shadow: 0 16px 32px rgba(0,0,0,.3); }
@@ -205,11 +206,25 @@ footer { text-align: center; padding: 30px; font-family: var(--mono); font-size:
   .mobile-trigger { display: block; }
   .command-deck { padding: 0 20px; } .layout-canvas { padding: 22px; }
   .dashboard-metrics-container { grid-template-columns: 1fr; gap: 10px; }
+  body.sidebar-locked { overflow: hidden; }
 }
 @media screen and (max-width: 768px) {
-  .workspace-bar { grid-template-columns: 1fr; }
+  .workspace-bar, .task-add-bar { grid-template-columns: 1fr; }
   .inv-split-row { grid-template-columns: 1fr; gap: 10px; padding: 14px; }
   .tl-title { width: auto; }
+  .ecosystem-grid { grid-template-columns: 1fr; }
+}
+@media screen and (max-width: 480px) {
+  .layout-canvas { padding: 16px; }
+  .command-deck { padding: 0 14px; flex-wrap: wrap; }
+  .auth-deck { padding: 26px 20px; }
+  .deck-title { font-size: 17px; }
+  .metric-number { font-size: 24px; }
+  .ecosystem-card, .task-node, .note, .member-row, .inv-workspace-block, .tl-item { padding: 16px; }
+  .inv-actions { flex-direction: column; }
+  .inv-actions .inv-btn { width: 100%; }
+  .invite-row { flex-direction: column; align-items: stretch; }
+  .invite-row select { max-width: none !important; }
 }
 </style>
 </head>
@@ -338,7 +353,7 @@ footer { text-align: center; padding: 30px; font-family: var(--mono); font-size:
         </div>
 
         <div class="tabpane active" id="pane-tasks">
-          <div class="workspace-bar" style="grid-template-columns:2fr 1fr 1fr auto;gap:12px;" id="taskAddBar">
+          <div class="workspace-bar task-add-bar" id="taskAddBar">
             <input type="text" id="newTaskInput" class="input-premium" placeholder="Add a task…">
             <select id="newTaskAssignee" class="input-premium" style="padding:10px;"><option value="">Unassigned</option></select>
             <input type="date" id="newTaskDue" class="input-premium" style="padding:10px;">
@@ -602,10 +617,10 @@ document.getElementById('savePwdBtn').onclick=async()=>{
 // NAV
 // ==================================================================
 document.getElementById('brandHome').onclick=()=>switchModule('projects');
-document.getElementById('menuToggle').onclick=()=>{document.getElementById('sidebar').classList.toggle('open');document.getElementById('sidebarOverlay').classList.toggle('show');};
-document.getElementById('sidebarOverlay').onclick=()=>{document.getElementById('sidebar').classList.remove('open');document.getElementById('sidebarOverlay').classList.remove('show');};
+document.getElementById('menuToggle').onclick=()=>{document.getElementById('sidebar').classList.toggle('open');document.getElementById('sidebarOverlay').classList.toggle('show');document.body.classList.toggle('sidebar-locked');};
+document.getElementById('sidebarOverlay').onclick=()=>{document.getElementById('sidebar').classList.remove('open');document.getElementById('sidebarOverlay').classList.remove('show');document.body.classList.remove('sidebar-locked');};
 function switchModule(module){
-  document.getElementById('sidebar').classList.remove('open');document.getElementById('sidebarOverlay').classList.remove('show');
+  document.getElementById('sidebar').classList.remove('open');document.getElementById('sidebarOverlay').classList.remove('show');document.body.classList.remove('sidebar-locked');
   document.querySelectorAll('.nav-pill').forEach(b=>b.classList.remove('active'));
   if(module==='projects'){
     document.getElementById('navProjects').classList.add('active');
@@ -676,14 +691,20 @@ function subscribeMyProjects(){
 
 document.getElementById('addProjectBtn').onclick=async()=>{
   const inp=document.getElementById('newProjectName'); const name=inp.value.trim(); if(!name) return;
+  const btn=document.getElementById('addProjectBtn'); btn.disabled=true;
+  const projRef=db.collection('projects').doc();
   try{
-    const batch=db.batch();
-    const projRef=db.collection('projects').doc();
-    batch.set(projRef,{name,description:'',ownerId:currentUser.id,counts:{todo:0,progress:0,done:0,breached:0},createdAt:FieldValue.serverTimestamp()});
-    batch.set(projRef.collection('members').doc(currentUser.id),{role:'owner',uid:currentUser.id,joinedAt:FieldValue.serverTimestamp()});
-    await batch.commit();
+    // Two sequential, separately-awaited writes — not a batch. The rule
+    // that lets the creator self-assign as owner checks the project doc's
+    // already-committed ownerId, so the project write must fully land first.
+    await projRef.set({name,description:'',ownerId:currentUser.id,counts:{todo:0,progress:0,done:0,breached:0},createdAt:FieldValue.serverTimestamp()});
+    await projRef.collection('members').doc(currentUser.id).set({role:'owner',uid:currentUser.id,joinedAt:FieldValue.serverTimestamp()});
     inp.value='';
-  }catch(e){showError(e.message);}
+  }catch(e){
+    showError(e.message);
+    await projRef.delete().catch(()=>{}); // avoid leaving an orphaned, member-less project
+  }
+  btn.disabled=false;
 };
 
 function renderDashboard(){
@@ -785,8 +806,11 @@ document.getElementById('deleteProjectBtn').onclick=async()=>{
     const notes=await projRef.collection('notes').get();
     const members=await projRef.collection('members').get();
     const batch=db.batch();
-    tasks.forEach(d=>batch.delete(d.ref)); notes.forEach(d=>batch.delete(d.ref)); members.forEach(d=>batch.delete(d.ref));
+    tasks.forEach(d=>batch.delete(d.ref));
+    notes.forEach(d=>batch.delete(d.ref));
+    members.forEach(d=>{ if(d.id!==currentUser.id) batch.delete(d.ref); }); // other members first
     batch.delete(projRef);
+    batch.delete(projRef.collection('members').doc(currentUser.id)); // own membership last — the project-delete rule needs it to still "exist" going in
     await batch.commit();
     showOk('Project deleted.');
     document.getElementById('backBtn').click();
@@ -1123,7 +1147,10 @@ async function openInvoiceForm(invoice){
   invItems=invoice?.items?.length?JSON.parse(JSON.stringify(invoice.items)):[{desc:'',qty:'',rate:''},{desc:'',qty:'',rate:''},{desc:'',qty:'',rate:''}];
   document.getElementById('inv_title').value=invoice?.invoice_title||'';
   document.getElementById('inv_number').value=invoice?.invoice_number||'generating…';
-  if(!invoice) document.getElementById('inv_number').value=await nextInvoiceNumber();
+  if(!invoice){
+    try{ document.getElementById('inv_number').value=await nextInvoiceNumber(); }
+    catch(e){ showError('Could not generate an invoice number: '+e.message); document.getElementById('inv_number').value=''; }
+  }
   document.getElementById('inv_client_name').value=invoice?.client_name||'';
   document.getElementById('inv_client_email').value=invoice?.client_email||'';
   document.getElementById('inv_client_phone').value=invoice?.client_phone||'';

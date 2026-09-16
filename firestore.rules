@@ -106,15 +106,19 @@ service cloud.firestore {
         allow read: if isMember(projectId);
         // Three ways a members/{uid} doc gets created, none of them requiring
         // the writer to already be a member (that would be circular):
-        //   1. Project creation — creator writes themselves in as 'owner' in
-        //      the same batch as the project doc, before it exists yet.
+        //   1. Project creation — creator writes the project doc FIRST (as a
+        //      separate, awaited request, not batched with this write), then
+        //      writes themselves in as 'owner'. This clause checks the
+        //      already-committed project's ownerId — no reliance on
+        //      same-batch write visibility, which Firestore doesn't
+        //      guarantee resolves in a particular order.
         //   2. Owner adds someone directly as editor/viewer.
         //   3. Invited user accepts — checked against a deterministic invite
         //      doc (project_invites/{projectId}_{uid}) instead of trusting
         //      the client's claimed role.
         allow create: if
           (isSelf(uid) && request.resource.data.role == 'owner' &&
-            !exists(/databases/$(database)/documents/projects/$(projectId))) ||
+            get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId == request.auth.uid) ||
           (isOwner(projectId) && request.resource.data.role in ['editor', 'viewer']) ||
           (isSelf(uid) &&
             exists(/databases/$(database)/documents/project_invites/$(projectId + '_' + uid)) &&
