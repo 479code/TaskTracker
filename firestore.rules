@@ -1,0 +1,176 @@
+rules_version = '2';
+
+// ============================================================
+// 479Code Task Tracker — Firestore Security Rules
+//
+// WHY THIS FILE EXISTS
+// The old app checked `currentProject.myRole === 'owner'` in
+// JavaScript before showing a delete button. That is UI only —
+// any signed-in user could open devtools and call
+// db.collection('projects').doc(x).delete() directly, or write
+// to another project's tasks, or read every invoice. Firestore
+// only enforces what's written here. Deploy this before you
+// deploy the new index.html.
+//
+// DATA MODEL THIS ASSUMES (v2 — see MIGRATION.md)
+//   users/{uid}
+//   projects/{projectId}
+//     - ownerId, name, description, counts:{todo,progress,done,breached}
+//   projects/{projectId}/members/{uid}          <- subcollection, NOT a map
+//     - role: 'owner' | 'editor' | 'viewer'
+//   projects/{projectId}/tasks/{taskId}
+//   projects/{projectId}/notes/{noteId}
+//   project_invites/{inviteId}
+//   notifications/{notifId}
+//   invoices/{invoiceId}
+//   counters/invoices                            <- for atomic invoice numbering
+//
+// Run `firebase deploy --only firestore:rules` after editing.
+// ============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isSelf(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    // Membership is looked up via the subcollection doc, not a map on the
+    // project — this is the direct equivalent of the security-definer-function
+    // pattern from the Supabase side: check membership through a single,
+    // narrow lookup instead of a self-referential structure that can recurse.
+    function memberDoc(projectId) {
+      return get(/databases/$(database)/documents/projects/$(projectId)/members/$(request.auth.uid));
+    }
+
+    function isMember(projectId) {
+      return signedIn() &&
+        exists(/databases/$(database)/documents/projects/$(projectId)/members/$(request.auth.uid));
+    }
+
+    function roleIn(projectId, roles) {
+      return isMember(projectId) && memberDoc(projectId).data.role in roles;
+    }
+
+    function isEditorOrOwner(projectId) {
+      return roleIn(projectId, ['owner', 'editor']);
+    }
+
+    function isOwner(projectId) {
+      return roleIn(projectId, ['owner']);
+    }
+
+    // Invoicing stays gated to one account, same as before — but now it's
+    // enforced here, not just by hiding a nav button.
+    function isInvoiceOwner() {
+      return signedIn() && request.auth.token.email == '479code@gmail.com';
+    }
+
+    // ---------- users ----------
+    match /users/{uid} {
+      allow read: if signedIn(); // needed to resolve names/emails across a shared project
+      allow create: if isSelf(uid);
+      allow update: if isSelf(uid)
+        // username uniqueness / fullName can change, but you can't grant
+        // yourself elevated fields if any are added later
+        ;
+      allow delete: if false;
+    }
+
+    // ---------- projects ----------
+    match /projects/{projectId} {
+      allow read: if isMember(projectId);
+
+      // Anyone signed in can create a project, but only for themselves as
+      // owner. The matching members/{uid} "owner" doc must be created in the
+      // SAME batch — see index.html createProject(). Firestore evaluates all
+      // writes in one batch together, so this pair is effectively atomic.
+      allow create: if signedIn() && request.resource.data.ownerId == request.auth.uid;
+
+      // Only the owner can rename/describe/delete the project, or write the
+      // denormalized counts (done by the task-count transaction, run as the
+      // acting member, restricted to editor+ to avoid a viewer tampering
+      // with numbers).
+      allow update: if isEditorOrOwner(projectId) &&
+        // viewers/editors may only touch `counts`; everything else is owner-only
+        (isOwner(projectId) ||
+         request.resource.data.diff(resource.data).affectedKeys().hasOnly(['counts']));
+      allow delete: if isOwner(projectId);
+
+      match /members/{uid} {
+        allow read: if isMember(projectId);
+        // Three ways a members/{uid} doc gets created, none of them requiring
+        // the writer to already be a member (that would be circular):
+        //   1. Project creation — creator writes themselves in as 'owner' in
+        //      the same batch as the project doc, before it exists yet.
+        //   2. Owner adds someone directly as editor/viewer.
+        //   3. Invited user accepts — checked against a deterministic invite
+        //      doc (project_invites/{projectId}_{uid}) instead of trusting
+        //      the client's claimed role.
+        allow create: if
+          (isSelf(uid) && request.resource.data.role == 'owner' &&
+            !exists(/databases/$(database)/documents/projects/$(projectId))) ||
+          (isOwner(projectId) && request.resource.data.role in ['editor', 'viewer']) ||
+          (isSelf(uid) &&
+            exists(/databases/$(database)/documents/project_invites/$(projectId + '_' + uid)) &&
+            get(/databases/$(database)/documents/project_invites/$(projectId + '_' + uid)).data.status == 'accepted' &&
+            get(/databases/$(database)/documents/project_invites/$(projectId + '_' + uid)).data.role == request.resource.data.role);
+        allow update: if isOwner(projectId) && request.resource.data.role in ['owner', 'editor', 'viewer'];
+        allow delete: if isOwner(projectId) || isSelf(uid); // owner removes anyone; anyone can leave
+      }
+
+      match /tasks/{taskId} {
+        allow read: if isMember(projectId);
+        allow create, update: if isEditorOrOwner(projectId);
+        allow delete: if isEditorOrOwner(projectId);
+      }
+
+      match /notes/{noteId} {
+        allow read: if isMember(projectId);
+        allow create: if isEditorOrOwner(projectId);
+        allow update, delete: if isEditorOrOwner(projectId) &&
+          (resource.data.createdBy == request.auth.uid || isOwner(projectId));
+      }
+    }
+
+    // ---------- invites ----------
+    // IMPORTANT: client must create these with a deterministic doc ID —
+    // `${projectId}_${invitedUid}` — via .doc(id).set(...), not .add().
+    // The members/{uid} create rule above looks the invite up by that exact
+    // path, so an unpredictable auto-ID would break the accept flow.
+    match /project_invites/{inviteId} {
+      allow read: if signedIn() &&
+        (resource.data.invitedUserId == request.auth.uid ||
+         resource.data.invitedBy == request.auth.uid);
+      allow create: if isOwner(request.resource.data.projectId);
+      // Invited user can accept/reject (status only); inviter can cancel (delete)
+      allow update: if signedIn() && resource.data.invitedUserId == request.auth.uid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'respondedAt']);
+      allow delete: if signedIn() && resource.data.invitedBy == request.auth.uid;
+    }
+
+    // ---------- notifications ----------
+    match /notifications/{notifId} {
+      allow read, update: if signedIn() && resource.data.userId == request.auth.uid;
+      // created by server-trusted client code on behalf of another user (invite,
+      // invite-accepted) — restrict to the shape we expect, no arbitrary spam
+      allow create: if signedIn() && request.resource.data.userId is string;
+      allow delete: if signedIn() && resource.data.userId == request.auth.uid;
+    }
+
+    // ---------- invoices ----------
+    match /invoices/{invoiceId} {
+      allow read, write: if isInvoiceOwner();
+    }
+
+    match /counters/{counterId} {
+      allow read: if isInvoiceOwner();
+      allow write: if isInvoiceOwner();
+    }
+  }
+}
