@@ -87,9 +87,10 @@ service cloud.firestore {
       allow read: if isMember(projectId);
 
       // Anyone signed in can create a project, but only for themselves as
-      // owner. The matching members/{uid} "owner" doc must be created in the
-      // SAME batch — see index.html createProject(). Firestore evaluates all
-      // writes in one batch together, so this pair is effectively atomic.
+      // owner. The matching members/{uid} "owner" doc is created right
+      // after, as a separate awaited request — see addProjectBtn in
+      // index.html and the members/create rule below for why it's not a
+      // single batch.
       allow create: if signedIn() && request.resource.data.ownerId == request.auth.uid;
 
       // Only the owner can rename/describe/delete the project, or write the
@@ -103,7 +104,20 @@ service cloud.firestore {
       allow delete: if isOwner(projectId);
 
       match /members/{uid} {
-        allow read: if isMember(projectId);
+        // Two ways to be allowed to read a members doc:
+        //   - it's your own (checked via resource.data.uid, the SAME field
+        //     the app's collectionGroup('members').where('uid','==',me)
+        //     query filters on — Firestore can only validate a broad query
+        //     against a rule that checks the field the query itself
+        //     filters by; checking the path segment instead, as an earlier
+        //     version of this rule did, isn't something Firestore can prove
+        //     safe for a collection-group query and gets the whole query
+        //     rejected, even for documents that would obviously pass)
+        //   - you're a member of the same project (for the Members tab,
+        //     which lists everyone — a normal, non-collection-group query
+        //     scoped to one known project, so isMember(projectId) is fine
+        //     there)
+        allow read: if (resource.data.uid == request.auth.uid) || isMember(projectId);
         // Three ways a members/{uid} doc gets created, none of them requiring
         // the writer to already be a member (that would be circular):
         //   1. Project creation — creator writes the project doc FIRST (as a
@@ -148,9 +162,15 @@ service cloud.firestore {
     // The members/{uid} create rule above looks the invite up by that exact
     // path, so an unpredictable auto-ID would break the accept flow.
     match /project_invites/{inviteId} {
+      // invitedUserId/invitedBy cover a direct read of one invite by ID.
+      // isOwner(resource.data.projectId) covers the owner's "pending
+      // invites for my project" list query — keyed on projectId, the same
+      // field that query's where() filters on, for the same reason as the
+      // members fix above.
       allow read: if signedIn() &&
         (resource.data.invitedUserId == request.auth.uid ||
-         resource.data.invitedBy == request.auth.uid);
+         resource.data.invitedBy == request.auth.uid ||
+         isOwner(resource.data.projectId));
       allow create: if isOwner(request.resource.data.projectId);
       // Invited user can accept/reject (status only); inviter can cancel (delete)
       allow update: if signedIn() && resource.data.invitedUserId == request.auth.uid &&
