@@ -1,8 +1,26 @@
 # 479Code Task Tracker — v2
 
 Firebase (Auth + Firestore) task tracker and invoice generator for 479Code.
-Static site, no build step — same deploy model as before (GitHub Pages /
-Firebase Hosting).
+Static site, no build step. Live on Vercel, auto-deploying from `main`.
+
+Firebase project: `code-tasktracker-e4d7f` (fresh project — no legacy data,
+so no migration step needed).
+
+## Deploy order
+
+1. `firebase login` (one-time, on your machine)
+2. `firebase use --add` → pick `code-tasktracker-e4d7f`
+3. `firebase deploy --only firestore:rules,firestore:indexes`
+4. Confirm **collection group queries** are enabled for `members` in the
+   Firebase console (Firestore → Indexes) — the composite index in
+   `firestore.indexes.json` prompts for this on first deploy if needed.
+
+That's it — no data migration, since the project starts empty. Do this
+**before** anyone signs up and creates real projects: until step 3 runs,
+whatever default rules Firestore assigned a brand-new project are what's
+actually governing reads/writes (usually locked-closed by default, which
+just means nothing works yet — not a security risk either way, but worth
+deploying the real rules before pointing anyone at the sign-up form).
 
 ## What changed from v1
 
@@ -14,44 +32,20 @@ Firebase Hosting).
 | Live updates | manual reload after every action, notifications polled every 30s | `onSnapshot` realtime listeners throughout |
 | Invoice numbers | `INV/MM/YYYY`, collided if two invoices made in the same month | atomic counter via a Firestore transaction |
 | Invoice access | hidden nav button if your email ≠ owner | hidden button **and** rejected at the database if you're not the owner |
-| Legacy files | `apps-script-backend.gs`, `legacy-sheets-version.html`, stale README | removed |
-
-## Deploy order (important)
-
-1. **Back up your Firestore data first** (Firebase console → Firestore → Export, or just export via `gcloud firestore export`).
-2. Sign in to the *old* `index.html` one more time to make sure nothing is mid-write.
-3. Open **`migrate.html`** in a browser (locally is fine — it talks straight to Firestore) and sign in as an account that owns every project. It converts:
-   - each project's `members` map → `members` subcollection docs, and computes the initial `counts`
-   - `notifications` snake_case fields → camelCase
-   - `project_invites` → deterministic IDs (`{projectId}_{invitedUid}`)
-
-   This step must run **before** the new rules are live, since the new rules
-   don't recognize the old shapes as valid writes.
-4. Deploy the new rules and indexes:
-   ```
-   firebase deploy --only firestore:rules,firestore:indexes
-   ```
-5. In the Firebase console, confirm **collection group queries** are enabled
-   for `members` (Firestore → Indexes → the collection-group index in
-   `firestore.indexes.json` will prompt for this on first deploy).
-6. Replace `index.html`, `sw.js`, `manifest.json` on your host with the new
-   versions here. Delete `apps-script-backend.gs`, `legacy-sheets-version.html`,
-   `migrate.html` from the live site once migration is confirmed working.
 
 ## Files
 
 - `index.html` — the app
 - `firestore.rules` — server-side access control (read the comments at the top — explains the membership model)
 - `firestore.indexes.json` / `firebase.json` — deploy config
-- `migrate.html` — one-time data migration tool, **delete after running**
 - `manifest.json`, `sw.js`, `icons/` — PWA shell
 
 ## Known trade-offs, on purpose
 
-- Invoice access is still gated by a single hardcoded email
-  (`479code@gmail.com`) rather than a roles collection — matches how it
-  worked before, now enforced in rules too. If invoicing needs to extend to
-  more than one person later, swap that check for a `roles/{uid}` doc lookup.
+- Invoice access is gated by a single hardcoded email (`479code@gmail.com`)
+  rather than a roles collection — enforced in rules, not just hidden in the
+  UI. If invoicing needs to extend to more than one person later, swap that
+  check for a `roles/{uid}` doc lookup.
 - The "breached" (overdue) count per project is computed with a
   `where('dueDate','<', today)` query filtered client-side by status,
   rather than a second aggregation query — Firestore doesn't support two
