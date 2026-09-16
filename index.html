@@ -498,13 +498,18 @@ document.getElementById('authSubmit').onclick=async()=>{
   const btn=document.getElementById('authSubmit'); btn.disabled=true;
   try{
     if(authMode==='signup'){
+      const cred=await auth.createUserWithEmailAndPassword(email,password);
+      // Username uniqueness check has to happen AFTER auth, not before —
+      // the users-collection read rule requires signedIn(), and before this
+      // line nobody is signed in yet.
+      let finalUsername='';
       if(username){
         const existing=await db.collection('users').where('username','==',username).limit(1).get();
-        if(!existing.empty){err.textContent='That username is taken.';btn.disabled=false;return;}
+        if(existing.empty){ finalUsername=username; }
       }
-      const cred=await auth.createUserWithEmailAndPassword(email,password);
-      await db.collection('users').doc(cred.user.uid).set({email,fullName:fullName||email.split('@')[0],username:username||'',createdAt:FieldValue.serverTimestamp()});
-      msg.textContent='Account created — signing you in…';
+      await db.collection('users').doc(cred.user.uid).set({email,fullName:fullName||email.split('@')[0],username:finalUsername,createdAt:FieldValue.serverTimestamp()});
+      if(username && !finalUsername){ msg.textContent='Account created — that username was taken, set another from the sidebar.'; }
+      else { msg.textContent='Account created — signing you in…'; }
     }else{
       await auth.signInWithEmailAndPassword(email,password);
     }
